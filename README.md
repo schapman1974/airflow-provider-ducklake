@@ -11,6 +11,7 @@ The DuckLakeHook uses Airflow connection fields and extras to configure the conn
 - Extra: JSON dict for all other settings (required for engine, storage_type, and conditional fields).
 
 Example extras JSON (adjust based on engine and storage_type):
+```json
 {
   "engine": "postgres",
   "dbname": "my_ducklake",
@@ -24,7 +25,7 @@ Example extras JSON (adjust based on engine and storage_type):
   "install_extensions": ["spatial"],  # Optional: Inherited from DuckDB provider
   "load_extensions": ["spatial"]      # Optional
 }
-
+```
 ### Supported Engines (set in extras['engine'])
 - duckdb: Requires 'metadata_file' in extras or host as file path.
 - sqlite: Requires 'metadata_file' in extras or host as file path.
