@@ -1,0 +1,3 @@
+airflow_provider_ducklake.egg-info/*
+airflow_provider_ducklake.egg-info/*.*
+dist/*

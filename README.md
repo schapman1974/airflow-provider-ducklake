@@ -23,7 +23,13 @@ Example extras JSON (adjust based on engine and storage_type):
   "aws_secret_access_key": "your-secret-access-key",
   "aws_region": "us-east-1",
   "install_extensions": ["spatial"],  # Optional: Inherited from DuckDB provider
-  "load_extensions": ["spatial"]      # Optional
+  "load_extensions": ["spatial"],     # Optional
+  "connect_stack": [                  # Optional: override default DuckLake install/load commands
+    "INSTALL httpfs;",
+    "LOAD httpfs;",
+    "INSTALL ducklake;",
+    "LOAD ducklake;"
+  ]
 }
 ```
 ### Supported Engines (set in extras['engine'])
@@ -39,3 +45,6 @@ Example extras JSON (adjust based on engine and storage_type):
 - local: Requires 'local_data_path'.
 
 The UI shows core fields; use extras for engine/storage-specific ones. For dynamic behavior, select engine/storage in extras and provide corresponding keys.
+If you need to customize the static DuckLake connection commands (for example to install additional extensions),
+provide a `connect_stack` list in extras. Commands that depend on runtime variables (secrets, thread settings,
+attachments, etc.) are always appended automatically by the hook.

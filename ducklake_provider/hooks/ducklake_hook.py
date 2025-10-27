@@ -24,7 +24,7 @@ class DuckLakeHook(DbApiHook):
         airflow_conn = self.get_connection(conn_id)
 
         # Extract configs from connection fields and extras
-        extra = airflow_conn.extra_dejson()  # Parses extra as dict
+        extra = airflow_conn.extra_dejson  # Parses extra as dict
 
         # Core configs (map from connection fields or extras)
         engine = extra.get("engine")
@@ -37,6 +37,9 @@ class DuckLakeHook(DbApiHook):
         pgdbname = extra.get("pgdbname", "")
         mysqldbname = extra.get("mysqldbname", "")
         storage_type = extra.get("storage_type", "s3")
+
+        # Performance settings
+        num_threads = extra.get("threads", 4)  # Configurable threads, default to 4
 
         # Storage-specific configs from extras
         s3_bucket = extra.get("s3_bucket", "")
@@ -60,8 +63,13 @@ class DuckLakeHook(DbApiHook):
         install_extensions: List[str] = extra.get("install_extensions", [])
         load_extensions: List[str] = extra.get("load_extensions", [])
 
+        # Validations
         if not engine:
             raise AirflowException("Engine must be specified in extras['engine'] (e.g., 'postgres', 'mysql', 'duckdb', 'sqlite').")
+
+        # Validate num_threads
+        if not isinstance(num_threads, int) or num_threads < 1:
+            raise AirflowException(f"'threads' must be a positive integer, got: {num_threads}")
 
         # Validate required vars based on storage_type
         if storage_type == 's3' and not (s3_bucket and s3_path):
@@ -78,7 +86,7 @@ class DuckLakeHook(DbApiHook):
 
         try:
             # Base install/load commands (including optional extensions)
-            connect_stack = [
+            default_connect_stack: List[str] = [
                 "INSTALL httpfs;",
                 "LOAD httpfs;",
                 "INSTALL aws;",
@@ -86,6 +94,13 @@ class DuckLakeHook(DbApiHook):
                 "INSTALL ducklake;",
                 "LOAD ducklake;",
             ]
+            user_connect_stack = extra.get("connect_stack")
+            if user_connect_stack is not None:
+                if not isinstance(user_connect_stack, list) or not all(isinstance(cmd, str) for cmd in user_connect_stack):
+                    raise AirflowException("extras['connect_stack'] must be a list of SQL command strings.")
+                connect_stack = user_connect_stack.copy()
+            else:
+                connect_stack = default_connect_stack.copy()
 
             # Install/load user-specified extensions (inherited from DuckDB)
             for ext in install_extensions:
@@ -139,11 +154,11 @@ class DuckLakeHook(DbApiHook):
             # Engine-specific secret (for DB engines like Postgres/MySQL)
             if engine in ['postgres', 'mysql']:
                 connect_stack.append(
-                    f"CREATE OR REPLACE SECRET db_secret (TYPE {engine.upper()}, HOST '{host}', USER '{username}', PASSWORD '{password}');"
+                    f"CREATE OR REPLACE SECRET db_secret (TYPE {engine}, HOST '{host}', USER '{username}', PASSWORD '{password}');"
                 )
 
-            # Set threads
-            connect_stack.append("SET threads to 4;")
+            # Set threads (now configurable)
+            connect_stack.append(f"SET threads to {num_threads};")
 
             # Build data_path based on storage_type
             if storage_type == 's3':
@@ -178,7 +193,7 @@ class DuckLakeHook(DbApiHook):
                 if command:
                     conn.execute(command)
 
-            logger.info(f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path}")
+            logger.info(f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path} (threads: {num_threads})")
             return conn
 
         except Exception as e:
