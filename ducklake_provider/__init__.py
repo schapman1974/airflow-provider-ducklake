@@ -4,7 +4,7 @@ def get_provider_info():
         "name": "DuckLake",
         "description": "DuckLake provider for Apache Airflow (based on DuckDB)",
         "hook-class-names": ["ducklake_provider.hooks.ducklake_hook.DuckLakeHook"],
-        "versions": ["0.0.7"],
+        "versions": ["0.0.8"],
         "connection-types": [
             {
                 "hook-class-name": "ducklake_provider.hooks.ducklake_hook.DuckLakeHook",

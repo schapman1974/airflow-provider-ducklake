@@ -154,7 +154,7 @@ class DuckLakeHook(DbApiHook):
             # Engine-specific secret (for DB engines like Postgres/MySQL)
             if engine in ['postgres', 'mysql']:
                 connect_stack.append(
-                    f"CREATE OR REPLACE SECRET db_secret (TYPE {engine.upper()}, HOST '{host}', USER '{username}', PASSWORD '{password}');"
+                    f"CREATE OR REPLACE SECRET (TYPE {engine}, HOST '{host}', USER '{username}', PASSWORD '{password}');"
                 )
 
             # Set threads (now configurable)
