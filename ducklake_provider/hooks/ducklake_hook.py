@@ -1,6 +1,7 @@
 from __future__ import annotations
-from typing import Dict, List
+from typing import Dict, List, Optional
 import logging
+import os
 
 import duckdb
 
@@ -8,6 +9,109 @@ from airflow.providers.common.sql.hooks.sql import DbApiHook
 from airflow.exceptions import AirflowException
 
 logger = logging.getLogger(__name__)
+
+MEMORY_PLAN_SETTINGS = {
+    "conservative": {"fraction": 0.15, "min_bytes": 256 * 1024**2, "max_bytes": 4 * 1024**3},
+    "midtier": {"fraction": 0.25, "min_bytes": 512 * 1024**2, "max_bytes": 16 * 1024**3},
+    "aggressive": {"fraction": 0.4, "min_bytes": 1024 * 1024**2, "max_bytes": 32 * 1024**3},
+}
+DEFAULT_MEMORY_PLAN = "midtier"
+ABS_MIN_MEMORY_BYTES = 256 * 1024**2  # Never allocate less than 256MB when possible
+
+
+def _format_duckdb_memory_limit(num_bytes: int) -> str:
+    """Format bytes into DuckDB-compatible memory strings (e.g., 4GB, 512MB)."""
+    if num_bytes >= 1024**3:
+        gigabytes = max(num_bytes // 1024**3, 1)
+        return f"{gigabytes}GB"
+    megabytes = max(num_bytes // 1024**2, 1)
+    return f"{megabytes}MB"
+
+
+def _get_available_memory_bytes() -> Optional[int]:
+    """Best-effort retrieval of available physical memory in bytes."""
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+
+    # /proc/meminfo provides MemAvailable on most Linux systems
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024  # Value is in kB
+    except (OSError, ValueError):
+        pass
+
+    # POSIX sysconf fallback
+    if hasattr(os, "sysconf"):
+        try:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if "SC_AVPHYS_PAGES" in os.sysconf_names:
+                avail_pages = os.sysconf("SC_AVPHYS_PAGES")
+                if isinstance(page_size, int) and isinstance(avail_pages, int):
+                    return page_size * avail_pages
+            elif "SC_PHYS_PAGES" in os.sysconf_names:
+                total_pages = os.sysconf("SC_PHYS_PAGES")
+                if isinstance(page_size, int) and isinstance(total_pages, int):
+                    return page_size * total_pages
+        except (ValueError, OSError):
+            pass
+
+    # Windows fallback via GlobalMemoryStatusEx
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullAvailPhys)
+    except Exception:
+        pass
+
+    return None
+
+
+def _determine_memory_limit_bytes(memory_plan: str) -> Optional[int]:
+    """Return a memory limit (in bytes) derived from available memory and the requested plan."""
+    plan_name = (memory_plan or DEFAULT_MEMORY_PLAN).lower()
+    settings = MEMORY_PLAN_SETTINGS.get(plan_name)
+    if settings is None:
+        raise AirflowException(
+            f"Invalid memory_plan '{memory_plan}'. Expected one of {list(MEMORY_PLAN_SETTINGS.keys())}."
+        )
+
+    available_bytes = _get_available_memory_bytes()
+    if not available_bytes:
+        return None
+
+    fraction_target = int(available_bytes * settings["fraction"])
+    limit_bytes = max(fraction_target, settings["min_bytes"])
+    limit_bytes = min(limit_bytes, settings["max_bytes"])
+    limit_bytes = min(limit_bytes, available_bytes)
+
+    if available_bytes >= ABS_MIN_MEMORY_BYTES:
+        limit_bytes = max(limit_bytes, ABS_MIN_MEMORY_BYTES)
+
+    return max(limit_bytes, 0) or None
 
 class DuckLakeHook(DbApiHook):
     """Interact with DuckLake (based on DuckDB), with support for various engines and storage types via connection fields and extras."""
@@ -17,6 +121,19 @@ class DuckLakeHook(DbApiHook):
     conn_type = "ducklake"
     hook_name = "DuckLake"
     placeholder = "?"
+
+    def __init__(
+        self,
+        *,
+        memory_plan: Optional[str] = None,
+        memory_limit: Optional[str] = None,
+        threads: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._configured_memory_plan = memory_plan
+        self._configured_memory_limit = memory_limit
+        self._configured_threads = threads
 
     def get_conn(self) -> duckdb.DuckDBPyConnection:
         """Sets up a DuckDB connection and attaches DuckLake using Airflow connection configs."""
@@ -38,9 +155,22 @@ class DuckLakeHook(DbApiHook):
         mysqldbname = extra.get("mysqldbname", "")
         storage_type = extra.get("storage_type", "s3")
 
-        # Performance settings
-        num_threads = extra.get("threads", 4)  # Configurable threads, default to 4
-        memory_limit = extra.get("memory_limit")  # Optional DuckDB memory limit (e.g., "8GB")
+        # Performance settings: hook kwargs override connection extras
+        num_threads = (
+            self._configured_threads
+            if self._configured_threads is not None
+            else extra.get("threads", 4)
+        )
+        memory_limit = (
+            self._configured_memory_limit
+            if self._configured_memory_limit is not None
+            else extra.get("memory_limit")
+        )
+        memory_plan = (
+            self._configured_memory_plan
+            if self._configured_memory_plan is not None
+            else extra.get("memory_plan", DEFAULT_MEMORY_PLAN)
+        )
 
         def _coerce_positive_int(value, field_name, default):
             """Coerce Airflow extra values to positive ints while tolerating blanks."""
@@ -82,11 +212,32 @@ class DuckLakeHook(DbApiHook):
         if not engine:
             raise AirflowException("Engine must be specified in extras['engine'] (e.g., 'postgres', 'mysql', 'duckdb', 'sqlite').")
 
-        # Normalize memory limit string
+        # Normalize memory plan and memory limit handling
+        memory_plan = (memory_plan or DEFAULT_MEMORY_PLAN).lower()
+        if memory_plan not in MEMORY_PLAN_SETTINGS:
+            raise AirflowException(
+                f"Invalid memory_plan '{memory_plan}'. Expected one of {list(MEMORY_PLAN_SETTINGS.keys())}."
+            )
+
         if memory_limit is not None:
             memory_limit = str(memory_limit).strip()
             if not memory_limit:
                 memory_limit = None
+
+        auto_memory_bytes: Optional[int] = None
+        if memory_limit is None:
+            auto_memory_bytes = _determine_memory_limit_bytes(memory_plan)
+            if auto_memory_bytes:
+                memory_limit = _format_duckdb_memory_limit(auto_memory_bytes)
+                logger.info(
+                    "Auto-selected DuckDB memory limit %s using '%s' memory plan.",
+                    memory_limit,
+                    memory_plan,
+                )
+            else:
+                logger.info(
+                    "Unable to determine available physical memory; DuckDB memory_limit will use the engine default."
+                )
 
         # Validate required vars based on storage_type
         if storage_type == 's3' and not (s3_bucket and s3_path):
@@ -213,7 +364,11 @@ class DuckLakeHook(DbApiHook):
                 if command:
                     conn.execute(command)
 
-            memory_log = f", memory_limit: {memory_limit}" if memory_limit else ""
+            if memory_limit:
+                source = "auto" if auto_memory_bytes else "manual"
+                memory_log = f", memory_limit: {memory_limit} ({source})"
+            else:
+                memory_log = f", memory_plan: {memory_plan}"
             logger.info(
                 f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path} (threads: {num_threads}{memory_log})"
             )

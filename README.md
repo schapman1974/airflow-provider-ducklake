@@ -48,3 +48,24 @@ The UI shows core fields; use extras for engine/storage-specific ones. For dynam
 If you need to customize the static DuckLake connection commands (for example to install additional extensions),
 provide a `connect_stack` list in extras. Commands that depend on runtime variables (secrets, thread settings,
 attachments, etc.) are always appended automatically by the hook.
+
+### Performance and Resource Controls
+The hook exposes a few knobs for tuning concurrency and memory usage:
+
+- `threads`: (int/string) Overrides DuckDB's worker thread count. Non-numeric/blank values are ignored and the default of 4 is used.
+- `memory_limit`: (string) A DuckDB-formatted limit such as `"4GB"` or `"512MB"`. If provided, this always wins.
+- `memory_plan`: (`"conservative"`, `"midtier"`, `"aggressive"`) Lets the hook auto-size `memory_limit` based on available RAM. Defaults to `"midtier"` if not configured.
+
+When `memory_limit` is omitted, DuckLake estimates available physical memory (using `psutil`, `/proc/meminfo`, POSIX `sysconf`, or Windows APIs), applies the selected plan’s fraction, and clamps within defined min/max bounds. This ensures the hook never grabs more than the machine can spare and still caps to sane maxima. If the machine’s free memory cannot be determined, DuckDB’s default memory settings are used.
+
+You can also pass these parameters directly when instantiating the hook in a DAG:
+
+```python
+from ducklake_provider.hooks.ducklake_hook import DuckLakeHook
+
+hook = DuckLakeHook(
+    ducklake_conn_id="ducklake_default",
+    memory_plan="conservative",  # or set memory_limit="6GB"
+    threads=8,
+)
+```
