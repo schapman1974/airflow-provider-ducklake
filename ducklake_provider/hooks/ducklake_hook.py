@@ -40,6 +40,21 @@ class DuckLakeHook(DbApiHook):
 
         # Performance settings
         num_threads = extra.get("threads", 4)  # Configurable threads, default to 4
+        memory_limit = extra.get("memory_limit")  # Optional DuckDB memory limit (e.g., "8GB")
+
+        def _coerce_positive_int(value, field_name, default):
+            """Coerce Airflow extra values to positive ints while tolerating blanks."""
+            if value in (None, ""):
+                return default
+            try:
+                coerced = int(value)
+            except (TypeError, ValueError):
+                raise AirflowException(f"'{field_name}' must be a positive integer, got: {value}")
+            if coerced < 1:
+                raise AirflowException(f"'{field_name}' must be a positive integer, got: {value}")
+            return coerced
+
+        num_threads = _coerce_positive_int(num_threads, "threads", 4)
 
         # Storage-specific configs from extras
         s3_bucket = extra.get("s3_bucket", "")
@@ -67,9 +82,11 @@ class DuckLakeHook(DbApiHook):
         if not engine:
             raise AirflowException("Engine must be specified in extras['engine'] (e.g., 'postgres', 'mysql', 'duckdb', 'sqlite').")
 
-        # Validate num_threads
-        if not isinstance(num_threads, int) or num_threads < 1:
-            raise AirflowException(f"'threads' must be a positive integer, got: {num_threads}")
+        # Normalize memory limit string
+        if memory_limit is not None:
+            memory_limit = str(memory_limit).strip()
+            if not memory_limit:
+                memory_limit = None
 
         # Validate required vars based on storage_type
         if storage_type == 's3' and not (s3_bucket and s3_path):
@@ -157,8 +174,11 @@ class DuckLakeHook(DbApiHook):
                     f"CREATE OR REPLACE SECRET (TYPE {engine}, HOST '{host}', USER '{username}', PASSWORD '{password}');"
                 )
 
-            # Set threads (now configurable)
-            connect_stack.append(f"SET threads to {num_threads};")
+            # Set threads and optional memory limit
+            connect_stack.append(f"SET threads TO {num_threads};")
+            if memory_limit:
+                sanitized_memory = memory_limit.replace("'", "''")
+                connect_stack.append(f"SET memory_limit='{sanitized_memory}';")
 
             # Build data_path based on storage_type
             if storage_type == 's3':
@@ -193,7 +213,10 @@ class DuckLakeHook(DbApiHook):
                 if command:
                     conn.execute(command)
 
-            logger.info(f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path} (threads: {num_threads})")
+            memory_log = f", memory_limit: {memory_limit}" if memory_limit else ""
+            logger.info(
+                f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path} (threads: {num_threads}{memory_log})"
+            )
             return conn
 
         except Exception as e:
