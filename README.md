@@ -19,9 +19,14 @@ Example extras JSON (adjust based on engine and storage_type):
   "storage_type": "s3",
   "s3_bucket": "your-s3-bucket",
   "s3_path": "your/s3/path/",
+  "encrypted": true,
   "aws_access_key_id": "your-access-key-id",
   "aws_secret_access_key": "your-secret-access-key",
   "aws_region": "us-east-1",
+  "expire_older_than": "1 day",
+  "delete_older_than": "1 day",
+  "parquet_version": 2,
+  "max_temp_directory_size": "100GB",
   "install_extensions": ["spatial"],  # Optional: Inherited from DuckDB provider
   "load_extensions": ["spatial"],     # Optional
   "connect_stack": [                  # Optional: override default DuckLake install/load commands
@@ -40,7 +45,7 @@ Example extras JSON (adjust based on engine and storage_type):
 
 ### Supported Storage Types (set in extras['storage_type'], default 's3')
 - s3: Requires 's3_bucket', 's3_path'; optional AWS creds.
-- azure: Requires 'azure_account_name', 'azure_container', 'azure_path'; optional connection_string.
+- azure: Requires 'azure_account_name', 'azure_container', 'azure_path'; optional 'azure_connection_string'.
 - gcs: Requires 'gcs_bucket', 'gcs_path'; optional service_account_key (JSON string).
 - local: Requires 'local_data_path'.
 
@@ -55,8 +60,21 @@ The hook exposes a few knobs for tuning concurrency and memory usage:
 - `threads`: (int/string) Overrides DuckDB's worker thread count. Non-numeric/blank values are ignored and the default of 4 is used.
 - `memory_limit`: (string) A DuckDB-formatted limit such as `"4GB"` or `"512MB"`. If provided, this always wins.
 - `memory_plan`: (`"conservative"`, `"midtier"`, `"aggressive"`) Lets the hook auto-size `memory_limit` based on available RAM. Defaults to `"midtier"` if not configured.
+- `max_temp_directory_size`: (string) A DuckDB-formatted spill limit such as `"100GB"`. If provided, the hook issues `SET max_temp_directory_size=...` before queries run.
+- `encrypted`: (bool/string) Adds `ENCRYPTED` to the DuckLake `ATTACH` options. Defaults to `true`.
+- `expire_older_than`: (string) Sets DuckLake's global expiry window after attach. Defaults to `"1 day"`.
+- `delete_older_than`: (string) Sets DuckLake's global delete retention window after attach. Defaults to `"1 day"`.
+- `parquet_version`: (int/string) Sets DuckLake's parquet writer version after attach. Defaults to `2`.
 
 When `memory_limit` is omitted, DuckLake estimates available physical memory (using `psutil`, `/proc/meminfo`, POSIX `sysconf`, or Windows APIs), applies the selected plan’s fraction, and clamps within defined min/max bounds. This ensures the hook never grabs more than the machine can spare and still caps to sane maxima. If the machine’s free memory cannot be determined, DuckDB’s default memory settings are used.
+
+The hook includes `ENCRYPTED` on every `ATTACH` by default. After the DuckLake catalog is attached, it also ensures these defaults exist when the catalog does not already have values for them:
+
+- `CALL <dbname>.set_option('expire_older_than', '1 day')`
+- `CALL <dbname>.set_option('delete_older_than', '1 day')`
+- `CALL <dbname>.set_option('parquet_version', 2)`
+
+If DuckLake already has values for those three options, the hook leaves the existing catalog settings unchanged.
 
 You can also pass these parameters directly when instantiating the hook in a DAG:
 
@@ -66,6 +84,7 @@ from ducklake_provider.hooks.ducklake_hook import DuckLakeHook
 hook = DuckLakeHook(
     ducklake_conn_id="ducklake_default",
     memory_plan="conservative",  # or set memory_limit="6GB"
+    max_temp_directory_size="100GB",
     threads=8,
 )
 ```

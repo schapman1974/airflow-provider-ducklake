@@ -19,6 +19,48 @@ DEFAULT_MEMORY_PLAN = "midtier"
 ABS_MIN_MEMORY_BYTES = 256 * 1024**2  # Never allocate less than 256MB when possible
 
 
+def _escape_sql_literal(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _format_sql_option_value(value) -> str:
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return f"'{_escape_sql_literal(str(value))}'"
+
+
+def _normalize_ducklake_option_value(value) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _fetch_ducklake_options(conn: duckdb.DuckDBPyConnection, dbname: str) -> Dict[str, str]:
+    option_queries = [
+        "FROM ducklake_options()",
+        "FROM options()",
+        f"FROM {dbname}.ducklake_options()",
+        f"FROM {dbname}.options()",
+    ]
+    last_error = None
+    for query in option_queries:
+        try:
+            rows = conn.execute(query).fetchall()
+            return {
+                str(option_name).strip().lower(): str(option_value).strip()
+                for option_name, _, option_value, _, _ in rows
+                if option_name
+            }
+        except Exception as exc:
+            last_error = exc
+    raise AirflowException(
+        f"Unable to read current DuckLake options after attach: {last_error}"
+    )
+
+
 def _format_duckdb_memory_limit(num_bytes: int) -> str:
     """Format bytes into DuckDB-compatible memory strings (e.g., 4GB, 512MB)."""
     if num_bytes >= 1024**3:
@@ -127,12 +169,14 @@ class DuckLakeHook(DbApiHook):
         *,
         memory_plan: Optional[str] = None,
         memory_limit: Optional[str] = None,
+        max_temp_directory_size: Optional[str] = None,
         threads: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._configured_memory_plan = memory_plan
         self._configured_memory_limit = memory_limit
+        self._configured_max_temp_directory_size = max_temp_directory_size
         self._configured_threads = threads
 
     def get_conn(self) -> duckdb.DuckDBPyConnection:
@@ -154,6 +198,10 @@ class DuckLakeHook(DbApiHook):
         pgdbname = extra.get("pgdbname", "")
         mysqldbname = extra.get("mysqldbname", "")
         storage_type = extra.get("storage_type", "s3")
+        expire_older_than = extra.get("expire_older_than", "1 day")
+        delete_older_than = extra.get("delete_older_than", "1 day")
+        parquet_version = extra.get("parquet_version", 2)
+        encrypted = extra.get("encrypted", True)
 
         # Performance settings: hook kwargs override connection extras
         num_threads = (
@@ -165,6 +213,11 @@ class DuckLakeHook(DbApiHook):
             self._configured_memory_limit
             if self._configured_memory_limit is not None
             else extra.get("memory_limit")
+        )
+        max_temp_directory_size = (
+            self._configured_max_temp_directory_size
+            if self._configured_max_temp_directory_size is not None
+            else extra.get("max_temp_directory_size")
         )
         memory_plan = (
             self._configured_memory_plan
@@ -184,7 +237,25 @@ class DuckLakeHook(DbApiHook):
                 raise AirflowException(f"'{field_name}' must be a positive integer, got: {value}")
             return coerced
 
+        def _coerce_bool(value, field_name):
+            """Coerce Airflow extra values to bool while tolerating common string forms."""
+            if isinstance(value, bool):
+                return value
+            if value in (None, ""):
+                return False
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "t", "yes", "y", "on"}:
+                    return True
+                if normalized in {"0", "false", "f", "no", "n", "off"}:
+                    return False
+            raise AirflowException(f"'{field_name}' must be a boolean, got: {value}")
+
         num_threads = _coerce_positive_int(num_threads, "threads", 4)
+        if encrypted in (None, ""):
+            encrypted = True
+        else:
+            encrypted = _coerce_bool(encrypted, "encrypted")
 
         # Storage-specific configs from extras
         s3_bucket = extra.get("s3_bucket", "")
@@ -223,6 +294,20 @@ class DuckLakeHook(DbApiHook):
             memory_limit = str(memory_limit).strip()
             if not memory_limit:
                 memory_limit = None
+        if max_temp_directory_size is not None:
+            max_temp_directory_size = str(max_temp_directory_size).strip()
+            if not max_temp_directory_size:
+                max_temp_directory_size = None
+        expire_older_than = str(expire_older_than).strip() or "1 day"
+        delete_older_than = str(delete_older_than).strip() or "1 day"
+        if parquet_version in (None, ""):
+            parquet_version = 2
+        elif isinstance(parquet_version, str):
+            parquet_version = parquet_version.strip() or 2
+            if isinstance(parquet_version, str) and parquet_version.isdigit():
+                parquet_version = int(parquet_version)
+        else:
+            parquet_version = parquet_version
 
         auto_memory_bytes: Optional[int] = None
         if memory_limit is None:
@@ -330,6 +415,11 @@ class DuckLakeHook(DbApiHook):
             if memory_limit:
                 sanitized_memory = memory_limit.replace("'", "''")
                 connect_stack.append(f"SET memory_limit='{sanitized_memory}';")
+            if max_temp_directory_size:
+                sanitized_temp_directory_size = max_temp_directory_size.replace("'", "''")
+                connect_stack.append(
+                    f"SET max_temp_directory_size='{sanitized_temp_directory_size}';"
+                )
 
             # Build data_path based on storage_type
             if storage_type == 's3':
@@ -343,15 +433,29 @@ class DuckLakeHook(DbApiHook):
             else:
                 raise AirflowException(f"Unsupported storage_type: {storage_type}")
 
+            attach_options = [
+                f"DATA_PATH '{_escape_sql_literal(data_path)}'",
+                f"METADATA_SCHEMA '{_escape_sql_literal(schema)}'",
+            ]
+            if encrypted:
+                attach_options.append("ENCRYPTED")
+            attach_options_sql = ", ".join(attach_options)
+
             # Engine-specific ATTACH command
             if engine == 'duckdb':
-                attach_cmd = f"ATTACH 'ducklake:{metadata_file}' AS {dbname} (DATA_PATH '{data_path}', METADATA_SCHEMA '{schema}');"
+                attach_cmd = f"ATTACH 'ducklake:{_escape_sql_literal(metadata_file)}' AS {dbname} ({attach_options_sql});"
             elif engine == 'sqlite':
-                attach_cmd = f"ATTACH 'ducklake:sqlite:{metadata_file}' AS {dbname} (DATA_PATH '{data_path}', METADATA_SCHEMA '{schema}');"
+                attach_cmd = f"ATTACH 'ducklake:sqlite:{_escape_sql_literal(metadata_file)}' AS {dbname} ({attach_options_sql});"
             elif engine == 'postgres':
-                attach_cmd = f"ATTACH 'ducklake:postgres:dbname={pgdbname} host={host}' AS {dbname} (DATA_PATH '{data_path}', METADATA_SCHEMA '{schema}');"
+                attach_cmd = (
+                    f"ATTACH 'ducklake:postgres:dbname={_escape_sql_literal(pgdbname)} "
+                    f"host={_escape_sql_literal(host)}' AS {dbname} ({attach_options_sql});"
+                )
             elif engine == 'mysql':
-                attach_cmd = f"ATTACH 'ducklake:mysql:db={mysqldbname} host={host}' AS {dbname} (DATA_PATH '{data_path}', METADATA_SCHEMA '{schema}');"
+                attach_cmd = (
+                    f"ATTACH 'ducklake:mysql:db={_escape_sql_literal(mysqldbname)} "
+                    f"host={_escape_sql_literal(host)}' AS {dbname} ({attach_options_sql});"
+                )
             else:
                 raise AirflowException(f"Unsupported engine: {engine}")
 
@@ -364,13 +468,48 @@ class DuckLakeHook(DbApiHook):
                 if command:
                     conn.execute(command)
 
+            existing_ducklake_options = _fetch_ducklake_options(conn, dbname)
+            desired_ducklake_options = {
+                "expire_older_than": expire_older_than,
+                "delete_older_than": delete_older_than,
+                "parquet_version": parquet_version,
+            }
+            applied_ducklake_options = {}
+            for option_name, option_value in desired_ducklake_options.items():
+                existing_value = _normalize_ducklake_option_value(
+                    existing_ducklake_options.get(option_name)
+                )
+                if existing_value is not None:
+                    applied_ducklake_options[option_name] = existing_value
+                    continue
+                conn.execute(
+                    f"CALL {dbname}.set_option('{option_name}', {_format_sql_option_value(option_value)});"
+                )
+                applied_ducklake_options[option_name] = str(option_value)
+
+            resource_log_parts = []
             if memory_limit:
                 source = "auto" if auto_memory_bytes else "manual"
-                memory_log = f", memory_limit: {memory_limit} ({source})"
+                resource_log_parts.append(f"memory_limit: {memory_limit} ({source})")
             else:
-                memory_log = f", memory_plan: {memory_plan}"
+                resource_log_parts.append(f"memory_plan: {memory_plan}")
+            if max_temp_directory_size:
+                resource_log_parts.append(
+                    f"max_temp_directory_size: {max_temp_directory_size}"
+                )
+            resource_log_parts.append(
+                f"expire_older_than: {applied_ducklake_options['expire_older_than']}"
+            )
+            resource_log_parts.append(
+                f"delete_older_than: {applied_ducklake_options['delete_older_than']}"
+            )
+            resource_log_parts.append(
+                f"parquet_version: {applied_ducklake_options['parquet_version']}"
+            )
+            resource_log_parts.append(f"encrypted: {encrypted}")
+            resource_log = f", {', '.join(resource_log_parts)}" if resource_log_parts else ""
             logger.info(
-                f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path} (threads: {num_threads}{memory_log})"
+                f"Connected to DuckLake with engine '{engine}' and storage '{storage_type}': {data_path} (threads: {num_threads}{resource_log})"
             )
             return conn
 
